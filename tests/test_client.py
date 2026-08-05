@@ -5,6 +5,7 @@ from typing import cast
 import aiohttp
 import pytest
 
+import repligit.client
 from repligit.asyncio.parse import read_packfile as async_read_packfile
 from repligit.asyncio.parse import read_pkt_lines as async_read_pkt_lines
 from repligit.exceptions import RemoteError, UnexpectedResponse
@@ -61,6 +62,14 @@ def _collect_async_pkt_lines(raw: bytes) -> list[str]:
         return [line async for line in async_read_pkt_lines(_async_stream(raw))]
 
     return asyncio.run(_collect())
+
+
+def _ls_remote(monkeypatch, raw: bytes) -> dict[str, str]:
+    """Run sync ls_remote against a canned HTTP response body."""
+    monkeypatch.setattr(
+        repligit.client, "http_request", lambda *args, **kwargs: io.BytesIO(raw)
+    )
+    return repligit.client.ls_remote("http://example.invalid/repo")
 
 
 # Responses exercised by both the sync and async read_packfile helpers.
@@ -230,6 +239,36 @@ def test_read_pkt_lines_sync_raises_on_err():
 def test_read_pkt_lines_async_raises_on_err():
     with pytest.raises(RemoteError):
         _collect_async_pkt_lines(_ERR_RESPONSE)
+
+
+# Advertisement of an empty repository: no refs, just the capabilities
+# placeholder line after the service announcement.
+_EMPTY_REPO_ADVERTISEMENT = (
+    _pkt(b"# service=git-upload-pack")
+    + b"0000"
+    + _pkt(f"{'0' * 40} capabilities^{{}}\x00multi_ack thin-pack".encode())
+    + b"0000"
+)
+
+
+def test_ls_remote_empty_repo(monkeypatch):
+    assert _ls_remote(monkeypatch, _EMPTY_REPO_ADVERTISEMENT) == {}
+
+
+def test_ls_remote_refs_and_head(monkeypatch):
+    assert _ls_remote(monkeypatch, _ADVERTISEMENT) == {
+        "HEAD": SHA_A,
+        "refs/heads/main": SHA_A,
+        "refs/tags/v1": SHA_B,
+    }
+
+
+def test_ls_remote_malformed_ref_line(monkeypatch):
+    raw = (
+        _pkt(b"# service=git-upload-pack") + b"0000" + _pkt(b"not-a-ref-line") + b"0000"
+    )
+    with pytest.raises(UnexpectedResponse):
+        _ls_remote(monkeypatch, raw)
 
 
 def test_encode_lines_from_bytes():

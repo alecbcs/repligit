@@ -2,7 +2,11 @@ import io
 from collections.abc import Generator, Iterable
 from typing import IO, BinaryIO
 
-from repligit.exceptions import RemoteError, UnexpectedResponse
+from repligit.exceptions import (
+    RefUpdateRejected,
+    RemoteError,
+    UnexpectedResponse,
+)
 
 
 def parse_pkt_length(prefix: bytes) -> int:
@@ -228,6 +232,46 @@ def read_packfile(stream: IO[bytes]) -> BinaryIO | None:
 
         # NAK / ACK / shallow / unshallow -> keep draining the negotiation.
         _read_pkt_payload(stream, line_length)
+
+
+def parse_ref_line(line: str) -> tuple[str, str] | None:
+    """Parse a "<sha> <ref>" line from a git-upload-pack ref advertisement.
+
+    The first ref line carries the server capabilities after a NUL byte
+    (e.g. "<sha> HEAD\\0multi_ack symref=HEAD:refs/heads/main ..."); only the
+    "<sha> <ref>" portion is kept, so HEAD is captured too.
+
+    Returns:
+        tuple[str, str]: The ``(sha, ref)`` pair.
+        None: For the "<zero-sha> capabilities^{}" placeholder an empty
+            repository advertises instead of real refs.
+
+    Raises:
+        UnexpectedResponse: If the line is not a valid ref advertisement.
+    """
+    try:
+        sha, ref = line.split("\x00", 1)[0].split()
+    except ValueError:
+        raise UnexpectedResponse(f"malformed ref line: {line!r}") from None
+
+    return None if ref == "capabilities^{}" else (sha, ref)
+
+
+def check_ref_status(ref: str, ref_status: str) -> None:
+    """Validate the per-ref status line of a receive-pack report.
+
+    Raises:
+        RefUpdateRejected: On "ng <ref> <reason>" (ng = not good), meaning the
+            remote rejected the update (non-fast-forward, hook declined,
+            missing objects, ...).
+        UnexpectedResponse: If the line is not "ok <ref>" either.
+    """
+    rejected_prefix = f"ng {ref} "
+    if ref_status.startswith(rejected_prefix):
+        raise RefUpdateRejected(ref_status[len(rejected_prefix) :])
+
+    if ref_status != f"ok {ref}":
+        raise UnexpectedResponse(f"unexpected ref status line: {ref_status!r}")
 
 
 def generate_send_pack_header(ref: str, from_sha: str, to_sha: str) -> bytes:

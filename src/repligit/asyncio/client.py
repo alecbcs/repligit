@@ -3,12 +3,13 @@ from collections.abc import Iterable
 import aiohttp
 
 from repligit.asyncio.parse import read_packfile, read_pkt_lines
-from repligit.exceptions import (
-    RefUpdateRejected,
-    UnexpectedResponse,
-    UnpackFailed,
+from repligit.exceptions import UnexpectedResponse, UnpackFailed
+from repligit.parse import (
+    check_ref_status,
+    generate_fetch_pack_request,
+    generate_send_pack_header,
+    parse_ref_line,
 )
-from repligit.parse import generate_fetch_pack_request, generate_send_pack_header
 
 
 async def ls_remote(
@@ -31,9 +32,9 @@ async def ls_remote(
 
         refs: dict[str, str] = {}
         async for line in lines:
-            # The first ref line carries the server capabilities after a NUL byte.
-            sha, ref = line.split("\x00", 1)[0].split()
-            refs[ref] = sha
+            if parsed := parse_ref_line(line):
+                sha, ref = parsed
+                refs[ref] = sha
         return refs
 
 
@@ -103,13 +104,4 @@ async def send_pack(
         if unpack_status != "unpack ok":
             raise UnpackFailed(unpack_status)
 
-        # "ng <ref> <reason>" (ng = not good) means the remote rejected the
-        # update. The reason may be non-fast-forward, hook declined, etc.
-        ref_status = await anext(lines)
-        prefix = f"ng {ref} "
-        if ref_status.startswith(prefix):
-            reason = ref_status[len(prefix) :]
-            raise RefUpdateRejected(reason)
-
-        if ref_status != f"ok {ref}":
-            raise UnexpectedResponse(f"unexpected ref status line: {ref_status!r}")
+        check_ref_status(ref, await anext(lines))

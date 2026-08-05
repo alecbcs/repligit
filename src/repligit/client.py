@@ -3,14 +3,12 @@ from collections.abc import Iterable
 from http.client import HTTPResponse
 from typing import BinaryIO
 
-from repligit.exceptions import (
-    RefUpdateRejected,
-    UnexpectedResponse,
-    UnpackFailed,
-)
+from repligit.exceptions import UnexpectedResponse, UnpackFailed
 from repligit.parse import (
+    check_ref_status,
     generate_fetch_pack_request,
     generate_send_pack_header,
+    parse_ref_line,
     read_packfile,
     read_pkt_lines,
 )
@@ -71,9 +69,9 @@ def ls_remote(
 
     refs: dict[str, str] = {}
     for line in lines:
-        # The first ref line carries the server capabilities after a NUL byte.
-        sha, ref = line.split("\x00", 1)[0].split()
-        refs[ref] = sha
+        if parsed := parse_ref_line(line):
+            sha, ref = parsed
+            refs[ref] = sha
     return refs
 
 
@@ -141,13 +139,4 @@ def send_pack(
     if unpack_status != "unpack ok":
         raise UnpackFailed(unpack_status)
 
-    # "ng <ref> <reason>" (ng = not good) means the remote rejected the update.
-    # The reason can be non-fast-forward, hook declined, missing objects, etc.
-    ref_status = next(lines)
-    prefix = f"ng {ref} "
-    if ref_status.startswith(prefix):
-        reason = ref_status[len(prefix) :]
-        raise RefUpdateRejected(reason)
-
-    if ref_status != f"ok {ref}":
-        raise UnexpectedResponse(f"unexpected ref status line: {ref_status!r}")
+    check_ref_status(ref, next(lines))
