@@ -2,13 +2,14 @@ from collections.abc import Iterable
 
 import aiohttp
 
-from repligit.asyncio.parse import decode_lines, iter_lines, read_packfile
-from repligit.exceptions import (
-    RefUpdateRejected,
-    UnexpectedResponse,
-    UnpackFailed,
+from repligit.asyncio.parse import read_packfile, read_pkt_lines
+from repligit.exceptions import UnexpectedResponse, UnpackFailed
+from repligit.parse import (
+    check_ref_status,
+    generate_fetch_pack_request,
+    generate_send_pack_header,
+    parse_ref_line,
 )
-from repligit.parse import generate_fetch_pack_request, generate_send_pack_header
 
 
 async def ls_remote(
@@ -24,19 +25,17 @@ async def ls_remote(
         aiohttp.ClientSession(auth=auth) as session,
         session.get(url, raise_for_status=True) as resp,
     ):
-        lines = decode_lines(iter_lines(resp, encoding="utf-8"))
+        lines = read_pkt_lines(resp.content)
         service_line = await anext(lines)
         if service_line != "# service=git-upload-pack":
             raise UnexpectedResponse(f"invalid service line: {service_line!r}")
 
-        # `async for` inside `dict()` not supported so no dict comprehension
-        result = {}
+        refs: dict[str, str] = {}
         async for line in lines:
-            if not line:
-                continue
-            sha, ref = line.split()
-            result[ref] = sha
-        return result
+            if parsed := parse_ref_line(line):
+                sha, ref = parsed
+                refs[ref] = sha
+        return refs
 
 
 async def fetch_pack(
@@ -100,18 +99,9 @@ async def send_pack(
             raise_for_status=True,
         ) as resp,
     ):
-        lines = decode_lines(iter_lines(resp, encoding="utf-8"))
+        lines = read_pkt_lines(resp.content)
         unpack_status = await anext(lines)
         if unpack_status != "unpack ok":
             raise UnpackFailed(unpack_status)
 
-        # "ng <ref> <reason>" (ng = not good) means the remote rejected the
-        # update. The reason may be non-fast-forward, hook declined, etc.
-        ref_status = await anext(lines)
-        prefix = f"ng {ref} "
-        if ref_status.startswith(prefix):
-            reason_str = ref_status[len(prefix) :]
-            raise RefUpdateRejected(reason_str)
-
-        if ref_status != f"ok {ref}":
-            raise UnexpectedResponse(f"unexpected ref status line: {ref_status!r}")
+        check_ref_status(ref, await anext(lines))

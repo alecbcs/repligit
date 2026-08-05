@@ -5,13 +5,15 @@ from typing import cast
 import aiohttp
 import pytest
 
+import repligit.client
 from repligit.asyncio.parse import read_packfile as async_read_packfile
+from repligit.asyncio.parse import read_pkt_lines as async_read_pkt_lines
 from repligit.exceptions import RemoteError, UnexpectedResponse
 from repligit.parse import (
-    decode_lines,
     encode_lines,
     generate_send_pack_header,
     read_packfile,
+    read_pkt_lines,
 )
 
 
@@ -48,9 +50,27 @@ class _AsyncStream:
         return chunk
 
 
+def _async_stream(data: bytes) -> aiohttp.StreamReader:
+    return cast(aiohttp.StreamReader, _AsyncStream(data))
+
+
 def _run_async(data: bytes) -> bytes | None:
-    reader = cast(aiohttp.StreamReader, _AsyncStream(data))
-    return asyncio.run(async_read_packfile(reader))
+    return asyncio.run(async_read_packfile(_async_stream(data)))
+
+
+def _collect_async_pkt_lines(raw: bytes) -> list[str]:
+    async def _collect() -> list[str]:
+        return [line async for line in async_read_pkt_lines(_async_stream(raw))]
+
+    return asyncio.run(_collect())
+
+
+def _ls_remote(monkeypatch, raw: bytes) -> dict[str, str]:
+    """Run sync ls_remote against a canned HTTP response body."""
+    monkeypatch.setattr(
+        repligit.client, "http_request", lambda *args, **kwargs: io.BytesIO(raw)
+    )
+    return repligit.client.ls_remote("http://example.invalid/repo")
 
 
 # Responses exercised by both the sync and async read_packfile helpers.
@@ -152,21 +172,104 @@ def test_read_packfile_async_raises_on_malformed(raw):
         _run_async(raw)
 
 
-def test_decode_lines():
-    raw_lines = [
-        "003fbef547a59eec448284136f03984dce0f2f8239a9 refs/pull/95/head",
-        "003f358aa046cd57dbca306e80d4c3fbb86edc5b36af refs/pull/96/head",
-        "0000",
-    ]
+# A realistic git-upload-pack ref advertisement. Note the flush packet after
+# the service line carries no trailing newline, and the first ref line embeds
+# the server capabilities after a NUL byte.
+_ADVERTISEMENT = (
+    _pkt(b"# service=git-upload-pack")
+    + b"0000"
+    + _pkt(
+        f"{SHA_A} HEAD\x00multi_ack thin-pack side-band-64k "
+        f"symref=HEAD:refs/heads/main".encode()
+    )
+    + _pkt(f"{SHA_A} refs/heads/main".encode())
+    + _pkt(f"{SHA_B} refs/tags/v1".encode())
+    + b"0000"
+)
 
-    decoded_lines = [
-        "bef547a59eec448284136f03984dce0f2f8239a9 refs/pull/95/head",
-        "358aa046cd57dbca306e80d4c3fbb86edc5b36af refs/pull/96/head",
-        "",
-    ]
+_ADVERTISEMENT_LINES = [
+    "# service=git-upload-pack",
+    f"{SHA_A} HEAD\x00multi_ack thin-pack side-band-64k symref=HEAD:refs/heads/main",
+    f"{SHA_A} refs/heads/main",
+    f"{SHA_B} refs/tags/v1",
+]
 
-    lines = list(decode_lines(raw_lines))
-    assert decoded_lines == lines
+
+def test_read_pkt_lines_frames_by_length_sync():
+    # Flush packets are skipped and one trailing LF is stripped per payload.
+    lines = list(read_pkt_lines(io.BytesIO(_ADVERTISEMENT)))
+    assert lines == _ADVERTISEMENT_LINES
+
+
+def test_read_pkt_lines_frames_by_length_async():
+    assert _collect_async_pkt_lines(_ADVERTISEMENT) == _ADVERTISEMENT_LINES
+
+
+# Malformed or truncated pkt-line streams that must raise UnexpectedResponse
+# rather than yielding truncated or garbage lines.
+_BAD_PKT_STREAMS = [
+    # Connection dropped mid-length-prefix.
+    pytest.param(_pkt(b"unpack ok") + b"00", id="truncated_prefix"),
+    # Connection dropped mid-pkt-line payload.
+    pytest.param(_pkt(b"unpack ok")[:8], id="truncated_payload"),
+    # Length prefix is not hex.
+    pytest.param(b"zzzz" + _pkt(b"unpack ok"), id="garbage_prefix"),
+    # Lengths 1-3 can never fit the 4-byte prefix itself. Notably, "0002"
+    # previously triggered read(-2), swallowing the rest of the stream.
+    pytest.param(b"0002" + _pkt(b"unpack ok"), id="bogus_length"),
+]
+
+
+@pytest.mark.parametrize("raw", _BAD_PKT_STREAMS)
+def test_read_pkt_lines_sync_raises_on_malformed(raw):
+    with pytest.raises(UnexpectedResponse):
+        list(read_pkt_lines(io.BytesIO(raw)))
+
+
+@pytest.mark.parametrize("raw", _BAD_PKT_STREAMS)
+def test_read_pkt_lines_async_raises_on_malformed(raw):
+    with pytest.raises(UnexpectedResponse):
+        _collect_async_pkt_lines(raw)
+
+
+def test_read_pkt_lines_sync_raises_on_err():
+    with pytest.raises(RemoteError):
+        list(read_pkt_lines(io.BytesIO(_ERR_RESPONSE)))
+
+
+def test_read_pkt_lines_async_raises_on_err():
+    with pytest.raises(RemoteError):
+        _collect_async_pkt_lines(_ERR_RESPONSE)
+
+
+# Advertisement of an empty repository: no refs, just the capabilities
+# placeholder line after the service announcement.
+_EMPTY_REPO_ADVERTISEMENT = (
+    _pkt(b"# service=git-upload-pack")
+    + b"0000"
+    + _pkt(f"{'0' * 40} capabilities^{{}}\x00multi_ack thin-pack".encode())
+    + b"0000"
+)
+
+
+def test_ls_remote_empty_repo(monkeypatch):
+    assert _ls_remote(monkeypatch, _EMPTY_REPO_ADVERTISEMENT) == {}
+
+
+def test_ls_remote_refs_and_head(monkeypatch):
+    assert _ls_remote(monkeypatch, _ADVERTISEMENT) == {
+        "HEAD": SHA_A,
+        "refs/heads/main": SHA_A,
+        "refs/tags/v1": SHA_B,
+    }
+
+
+def test_ls_remote_malformed_ref_line(monkeypatch):
+    raw = (
+        _pkt(b"# service=git-upload-pack") + b"0000" + _pkt(b"not-a-ref-line") + b"0000"
+    )
+    with pytest.raises(UnexpectedResponse):
+        _ls_remote(monkeypatch, raw)
 
 
 def test_encode_lines_from_bytes():

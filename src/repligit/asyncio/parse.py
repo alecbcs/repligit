@@ -1,9 +1,49 @@
 import asyncio
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterator
 
 import aiohttp
 
 from repligit.exceptions import RemoteError, UnexpectedResponse
+from repligit.parse import parse_pkt_length
+
+
+async def _read_pkt_prefix(reader: aiohttp.StreamReader) -> bytes:
+    """Read the next 4-byte pkt-line length prefix.
+
+    Returns ``b""`` at a clean end of stream. Raises ``UnexpectedResponse``
+    if the stream is truncated mid-prefix.
+    """
+    try:
+        return await reader.readexactly(4)
+    except asyncio.IncompleteReadError as e:
+        if not e.partial:
+            return b""
+        raise UnexpectedResponse(
+            f"response truncated mid-pkt-line: {e.partial!r}"
+        ) from None
+
+
+async def _read_pkt_payload(
+    reader: aiohttp.StreamReader, line_length: int, encoding: str = "utf-8"
+) -> bytes:
+    """Read the payload of a pkt-line whose length prefix was already read.
+
+    Raises ``UnexpectedResponse`` if the stream is truncated mid-payload and
+    ``RemoteError`` if the payload is an ``ERR`` line (e.g. "ERR upload-pack:
+    not our ref <sha>").
+    """
+    try:
+        payload = await reader.readexactly(line_length - 4)
+    except asyncio.IncompleteReadError as e:
+        raise UnexpectedResponse(
+            f"response truncated mid-pkt-line: expected {line_length - 4} "
+            f"bytes, got {len(e.partial)}"
+        ) from None
+
+    if payload[:3] == b"ERR":
+        raise RemoteError(payload.decode(encoding).strip())
+
+    return payload
 
 
 async def read_packfile(reader: aiohttp.StreamReader) -> bytes | None:
@@ -32,92 +72,66 @@ async def read_packfile(reader: aiohttp.StreamReader) -> bytes | None:
             pkt-line is malformed.
     """
     while True:
-        try:
-            prefix = await reader.readexactly(4)
-        except asyncio.IncompleteReadError as e:
-            if not e.partial:
-                # Clean end of stream without a packfile (nothing to fetch).
-                return None
-            raise UnexpectedResponse(
-                f"response truncated mid-pkt-line: {e.partial!r}"
-            ) from None
+        prefix = await _read_pkt_prefix(reader)
 
         # The packfile is not length-prefixed; it begins with "PACK". This can
         # never collide with a pkt-line length prefix, which is 4 hex digits.
         if prefix == b"PACK":
             return prefix + await reader.read()
 
-        try:
-            line_length = int(prefix, 16)
-        except ValueError:
-            raise UnexpectedResponse(f"invalid pkt-line length: {prefix!r}") from None
+        if not prefix:
+            # Clean end of stream without a packfile (nothing to fetch).
+            return None
 
+        line_length = parse_pkt_length(prefix)
         if line_length == 0:
             # Flush packet ("0000"); keep draining.
             continue
 
-        if line_length < 4:
-            # 1-3 never denote a valid payload length in this response.
-            raise UnexpectedResponse(f"invalid pkt-line length: {prefix!r}")
-
-        try:
-            line = await reader.readexactly(line_length - 4)
-        except asyncio.IncompleteReadError as e:
-            raise UnexpectedResponse(
-                f"response truncated mid-pkt-line: expected {line_length - 4} "
-                f"bytes, got {len(e.partial)}"
-            ) from None
-
-        # e.g. "ERR upload-pack: not our ref <sha>"
-        if line[:3] == b"ERR":
-            raise RemoteError(line.decode("utf-8").strip())
-
-        # NAK / ACK / shallow / unshallow -> continue draining negotiation.
+        # NAK / ACK / shallow / unshallow -> keep draining the negotiation.
+        await _read_pkt_payload(reader, line_length)
 
 
-async def decode_lines(line_stream: AsyncIterable) -> AsyncIterator:
-    """Decode git server response iterator into individual data lines.
-
-    This asynchronous function processes a stream of lines from a server response,
-    where each line is prefixed with a 4-character hexadecimal length indicator.
-    It extracts and yields the actual data portion of each line.
-
-    Args:
-        line_stream: An asynchronous iterable providing the raw server response lines.
-
-    Yields:
-        The decoded data portion of each line, with the length prefix removed.
-    """
-    async for line in line_stream:
-        line_length = int(line[:4], 16)
-        yield line[4:line_length]
-
-
-async def iter_lines(
-    resp: aiohttp.ClientResponse, encoding: str = "utf-8", chunk_size: int = 16 * 1024
+async def read_pkt_lines(
+    reader: aiohttp.StreamReader, encoding: str = "utf-8"
 ) -> AsyncIterator[str]:
-    """
-    Asynchronously iterate over the lines of an HTTP response.
+    """Yield the decoded payload of each pkt-line from a git response stream.
+
+    This frames the stream by length exactly as the git pkt-line format
+    dictates rather than splitting on newlines, which is fragile: pkt-line
+    payloads may embed ``\\0`` (capabilities) and flush packets (``0000``)
+    carry no trailing newline. Each pkt-line is read as a 4-hex-digit length
+    prefix followed by ``length - 4`` payload bytes.
+
+    Flush packets (``0000``) are skipped. A single optional trailing ``LF`` is
+    stripped from each payload before it is decoded and yielded.
+
+    ``reader`` is an asynchronous byte stream exposing ``readexactly``
+    (e.g. ``aiohttp.ClientResponse.content``).
 
     Args:
-        resp: The aiohttp ClientResponse object to read from.
-        encoding: The character encoding to use for decoding bytes to strings.
-            Defaults to "utf-8".
-        chunk_size: The number of bytes to read in each chunk.
-            Defaults to 16 KiB (16 * 1024 bytes).
+        reader: The asynchronous response byte stream.
+        encoding: Character encoding used to decode payloads. Defaults to
+            "utf-8".
 
     Yields:
-        str: Each line from the response, with trailing carriage returns removed
-            and decoded using the specified encoding.
+        str: The decoded payload of each data pkt-line.
+
+    Raises:
+        RemoteError: If the server sends an ``ERR`` pkt-line.
+        UnexpectedResponse: If the stream is truncated mid-pkt-line or a
+            pkt-line is malformed.
     """
-    incomplete_line = bytearray()
+    while True:
+        prefix = await _read_pkt_prefix(reader)
+        if not prefix:
+            # Clean end of stream.
+            return
 
-    async for chunk in resp.content.iter_chunked(chunk_size):
-        lines = (incomplete_line + chunk).split(b"\n")
-        incomplete_line = lines.pop()
+        line_length = parse_pkt_length(prefix)
+        if line_length == 0:
+            # Flush packet ("0000"); carries no payload.
+            continue
 
-        for line in lines:
-            yield line.rstrip(b"\r").decode(encoding)
-
-    if incomplete_line:
-        yield incomplete_line.rstrip(b"\r").decode(encoding)
+        payload = await _read_pkt_payload(reader, line_length, encoding)
+        yield payload.removesuffix(b"\n").decode(encoding)
